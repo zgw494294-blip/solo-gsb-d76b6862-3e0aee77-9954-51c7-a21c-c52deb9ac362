@@ -10,6 +10,12 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_v
 #: Maximum number of items (snapshots + log segments) accepted in one batch.
 MAX_BATCH_SIZE = 100
 
+#: Cleanup limits: distinct record ids and protected query moments per request.
+MAX_CLEANUP_IDS = 100
+MIN_CLEANUP_IDS = 1
+MAX_PROTECTED_TIMES = 8
+MIN_PROTECTED_TIMES = 1
+
 
 def to_utc(value: datetime) -> datetime:
     """Normalize a datetime to aware UTC. Naive input is assumed to be UTC."""
@@ -79,4 +85,42 @@ class BatchIn(BaseModel):
         duplicates = sorted({i for i in ids if ids.count(i) > 1})
         if duplicates:
             raise ValueError(f"duplicate id(s) within batch: {duplicates}; batch rejected")
+        return self
+
+
+class CleanupIn(BaseModel):
+    """One batch-cleanup request.
+
+    ``ids`` lists registered snapshots/log segments to delete; ``protected_at``
+    lists UTC moments whose best recovery endpoint must not decrease. Either
+    every listed id is deleted or none is.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ids: List[StrictStr] = Field(
+        min_length=MIN_CLEANUP_IDS, max_length=MAX_CLEANUP_IDS
+    )
+    protected_at: List[datetime] = Field(
+        min_length=MIN_PROTECTED_TIMES, max_length=MAX_PROTECTED_TIMES
+    )
+
+    @field_validator("ids")
+    @classmethod
+    def _check_nonempty_ids(cls, value: List[str]) -> List[str]:
+        empty = [i for i, v in enumerate(value) if not v]
+        if empty:
+            raise ValueError(f"ids[{empty[0]}] must be a non-empty string")
+        return value
+
+    @field_validator("protected_at")
+    @classmethod
+    def _normalize_protected_at(cls, value: List[datetime]) -> List[datetime]:
+        return [to_utc(v) for v in value]
+
+    @model_validator(mode="after")
+    def _check_distinct_ids(self) -> "CleanupIn":
+        duplicates = sorted({i for i in self.ids if self.ids.count(i) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate id(s) in request: {duplicates}; cleanup rejected")
         return self

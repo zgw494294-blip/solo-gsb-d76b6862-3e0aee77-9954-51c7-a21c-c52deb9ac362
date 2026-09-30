@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
 
 from . import db
-from .models import BatchIn, to_utc
+from .models import BatchIn, CleanupIn, to_utc
 from .planner import build_plan
 
 
@@ -99,4 +100,78 @@ def recovery_plan(
             for step in plan.steps
         ],
         "endpoint": plan.endpoint,
+    }
+
+
+def _endpoint_rank(endpoint: Optional[int]) -> int:
+    """Ordering used when comparing recovery endpoints.
+
+    ``None`` (no recovery point) ranks below every non-negative sequence
+    number.
+    """
+    return -1 if endpoint is None else endpoint
+
+
+@app.post("/cleanups")
+def cleanup_batch(cleanup: CleanupIn) -> dict:
+    """Delete registered snapshots/log segments in one batch.
+
+    For every protected UTC moment the best recovery endpoint is compared
+    before the deletion and after deleting the whole requested batch, using
+    the existing planning rules. The batch is deleted only when no moment's
+    endpoint decreases (``None`` means no recovery point and ranks below
+    every sequence number); neither the original snapshot nor the original
+    replay chain has to be preserved. The check and the deletion run in one
+    database transaction, so a rejected cleanup leaves nothing deleted.
+    """
+    conn = db.connect_immediate()
+    try:
+        existing = db.all_ids(conn)
+        missing = sorted(set(cleanup.ids) - existing)
+        if missing:
+            conn.rollback()
+            raise HTTPException(
+                status_code=404,
+                detail=f"id(s) not registered: {missing}; cleanup rejected",
+            )
+
+        ids_to_delete = set(cleanup.ids)
+        snapshots, segments = db.load_all(conn)
+        remaining_snapshots = [s for s in snapshots if s.id not in ids_to_delete]
+        remaining_segments = [s for s in segments if s.id not in ids_to_delete]
+
+        before = []
+        after = []
+        for at in cleanup.protected_at:
+            plan_before = build_plan(snapshots, segments, at)
+            plan_after = build_plan(remaining_snapshots, remaining_segments, at)
+            before.append(None if plan_before is None else plan_before.endpoint)
+            after.append(None if plan_after is None else plan_after.endpoint)
+
+        degraded = [
+            {"at": at.isoformat(), "before": b, "after": a}
+            for at, b, a in zip(cleanup.protected_at, before, after)
+            if _endpoint_rank(a) < _endpoint_rank(b)
+        ]
+        if degraded:
+            conn.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "recovery endpoint would decrease at protected moment(s); nothing deleted",
+                    "degraded_moments": degraded,
+                },
+            )
+
+        db.delete_records(conn, cleanup.ids)
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "deleted_ids": list(cleanup.ids),
+        "endpoints": [
+            {"at": at.isoformat(), "endpoint": endpoint}
+            for at, endpoint in zip(cleanup.protected_at, after)
+        ],
     }

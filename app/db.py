@@ -43,6 +43,19 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def connect_immediate() -> sqlite3.Connection:
+    """Open a connection holding a write transaction (BEGIN IMMEDIATE).
+
+    Checks and writes performed through this connection see the same committed
+    database state and are serialized against other writers, so read-check
+    decisions cannot be invalidated by a concurrent commit.
+    """
+    conn = sqlite3.connect(get_db_path())
+    conn.row_factory = sqlite3.Row
+    conn.execute("BEGIN IMMEDIATE")
+    return conn
+
+
 def init_db() -> None:
     path = get_db_path()
     if path != ":memory:":
@@ -75,6 +88,16 @@ def insert_batch(conn: sqlite3.Connection, batch: BatchIn) -> None:
                 for s in batch.log_segments
             ],
         )
+
+
+def delete_records(conn: sqlite3.Connection, ids: List[str]) -> None:
+    """Delete the given ids from both tables within the current transaction.
+
+    Ids are globally unique across the two tables, so at most one row per id
+    is affected.
+    """
+    conn.executemany("DELETE FROM snapshots WHERE id = ?", [(i,) for i in ids])
+    conn.executemany("DELETE FROM log_segments WHERE id = ?", [(i,) for i in ids])
 
 
 def load_all(conn: sqlite3.Connection) -> Tuple[List[Snapshot], List[LogSegment]]:
