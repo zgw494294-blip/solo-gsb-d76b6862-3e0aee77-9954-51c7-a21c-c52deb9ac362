@@ -8,8 +8,8 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException, Query
 
 from . import db
-from .models import BatchIn, to_utc
-from .planner import build_plan
+from .models import BatchIn, CleanupIn, to_utc
+from .planner import build_plan, best_endpoint
 
 
 @asynccontextmanager
@@ -22,9 +22,10 @@ app = FastAPI(
     title="Recovery Planner",
     version="1.0.0",
     description=(
-        "Register database snapshots and log segments in batches, then ask for "
+        "Register database snapshots and log segments in batches, ask for "
         "the optimal recovery plan (snapshot + continuous same-format log "
-        "replay) at a given UTC time."
+        "replay) at a given UTC time, and batch-delete records while "
+        "verifying that protected recovery moments stay intact."
     ),
     lifespan=lifespan,
 )
@@ -100,3 +101,71 @@ def recovery_plan(
         ],
         "endpoint": plan.endpoint,
     }
+
+
+@app.post("/cleanup")
+def cleanup(cleanup_in: CleanupIn) -> dict:
+    """Batch-delete registered snapshots/log segments guarded by protected moments.
+
+    For each protected UTC moment the best recovery endpoint before the
+    deletion is compared with the best endpoint after deleting all requested
+    ids. The deletion happens only when no moment's endpoint decreases
+    (``None`` marks "no recovery point" and lies below every sequence
+    number). If any moment decreases, nothing is deleted and every decreased
+    moment with its before/after endpoints is returned. The comparison and
+    the deletion run in one transaction against one database state, so a
+    failure never leaves a partial deletion.
+    """
+    ids = cleanup_in.ids
+    moments = cleanup_in.moments
+    conn = db.connect()
+    try:
+        # Acquire the write lock up front and take a single consistent
+        # snapshot: all planning below and the final delete see this state.
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = db.all_ids(conn)
+            unknown = sorted(set(ids) - existing)
+            if unknown:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"id(s) not registered: {unknown}; request rejected",
+                )
+
+            snapshots, segments = db.load_all(conn)
+            id_set = set(ids)
+            remaining_snapshots = [s for s in snapshots if s.id not in id_set]
+            remaining_segments = [s for s in segments if s.id not in id_set]
+
+            decreased = []
+            retained = []
+            for at in moments:
+                before = best_endpoint(snapshots, segments, at)
+                after = best_endpoint(remaining_snapshots, remaining_segments, at)
+                if before is not None and (after is None or after < before):
+                    decreased.append(
+                        {"at": at.isoformat(), "before": before, "after": after}
+                    )
+                retained.append({"at": at.isoformat(), "endpoint": after})
+
+            if decreased:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": (
+                            "best recovery endpoint decreases at one or more "
+                            "protected moments; nothing was deleted"
+                        ),
+                        "decreased": decreased,
+                    },
+                )
+
+            db.delete_records(conn, ids)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return {"deleted_ids": ids, "endpoints": retained}
+    finally:
+        conn.close()

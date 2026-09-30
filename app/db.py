@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from datetime import datetime
-from typing import List, Set, Tuple
+from typing import Iterable, List, Set, Tuple
 
 from .models import BatchIn
 from .planner import LogSegment, Snapshot
@@ -75,6 +75,16 @@ def insert_batch(conn: sqlite3.Connection, batch: BatchIn) -> None:
                 for s in batch.log_segments
             ],
         )
+
+
+def delete_records(conn: sqlite3.Connection, ids: Iterable[str]) -> None:
+    """Delete the given ids from both tables within the caller's transaction.
+
+    The check and this deletion must share one connection/transaction so the
+    comparison and the write see the same database state.
+    """
+    conn.executemany("DELETE FROM snapshots WHERE id = ?", [(i,) for i in ids])
+    conn.executemany("DELETE FROM log_segments WHERE id = ?", [(i,) for i in ids])
 
 
 def load_all(conn: sqlite3.Connection) -> Tuple[List[Snapshot], List[LogSegment]]:

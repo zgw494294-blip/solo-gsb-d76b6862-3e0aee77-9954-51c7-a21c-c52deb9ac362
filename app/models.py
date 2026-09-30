@@ -80,3 +80,42 @@ class BatchIn(BaseModel):
         if duplicates:
             raise ValueError(f"duplicate id(s) within batch: {duplicates}; batch rejected")
         return self
+
+
+#: Limits for one protected-moment cleanup request.
+MIN_CLEANUP_IDS = 1
+MAX_CLEANUP_IDS = 100
+MIN_CLEANUP_MOMENTS = 1
+MAX_CLEANUP_MOMENTS = 8
+
+
+class CleanupIn(BaseModel):
+    """Batch-delete request guarded by protected UTC moments.
+
+    ``ids`` must hold 1..100 distinct registered record ids (snapshots or
+    log segments); ``moments`` must hold 1..8 UTC query times. Duplicate ids
+    (or ids absent from the database) reject the whole request.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ids: List[StrictStr] = Field(min_length=MIN_CLEANUP_IDS, max_length=MAX_CLEANUP_IDS)
+    moments: List[datetime] = Field(
+        min_length=MIN_CLEANUP_MOMENTS, max_length=MAX_CLEANUP_MOMENTS
+    )
+
+    @field_validator("ids")
+    @classmethod
+    def _check_ids(cls, value: List[str]) -> List[str]:
+        empty = [i for i in value if not i]
+        if empty:
+            raise ValueError("ids must be non-empty strings")
+        duplicates = sorted({i for i in value if value.count(i) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate id(s) in request: {duplicates}; request rejected")
+        return value
+
+    @field_validator("moments")
+    @classmethod
+    def _normalize_moments(cls, value: List[datetime]) -> List[datetime]:
+        return [to_utc(v) for v in value]

@@ -272,3 +272,221 @@ def test_snapshot_created_after_query_time_invisible(client):
 
 def test_invalid_query_time_rejected(client):
     assert plan(client, "not-a-time").status_code == 422
+
+
+# ---------------------------------------------------------------- cleanup
+
+
+def cleanup(client, ids, moments):
+    return client.post(
+        "/cleanup", json={"ids": list(ids), "moments": list(moments)}
+    )
+
+
+def test_cleanup_unused_items_deleted(client):
+    register(
+        client,
+        snapshots=[
+            snap("old", "2026-01-01T00:00:00Z", 5),
+            snap("new", "2026-07-01T00:00:00Z", 100),
+        ],
+        segments=[seg("seg-a", "2026-02-01T00:00:00Z", 6, 50)],
+    )
+    # at the late moment the newest snapshot alone reaches 100; seg-a and the
+    # old snapshot are irrelevant there and may be removed
+    r = cleanup(
+        client,
+        ["seg-a", "old"],
+        ["2026-08-01T00:00:00Z"],
+    )
+    assert r.status_code == 200
+    assert r.json() == {
+        "deleted_ids": ["seg-a", "old"],
+        "endpoints": [{"at": "2026-08-01T00:00:00+00:00", "endpoint": 100}],
+    }
+    # deletion is real: at the earlier moment only the old snapshot existed,
+    # so there is no recovery point anymore
+    assert plan(client, "2026-03-01T00:00:00Z").status_code == 404
+    body = plan(client, "2026-08-01T00:00:00Z").json()
+    assert body["snapshot"]["id"] == "new"
+    assert body["endpoint"] == 100
+
+
+def test_cleanup_blocked_when_any_moment_decreases_and_nothing_deleted(client):
+    register(
+        client,
+        snapshots=[
+            snap("old", "2026-01-01T00:00:00Z", 5),
+            snap("new", "2026-07-01T00:00:00Z", 100),
+        ],
+        segments=[seg("seg-a", "2026-02-01T00:00:00Z", 6, 50)],
+    )
+    # early moment: endpoint 50 via old + seg-a; late moment: endpoint 100.
+    # deleting "new" is harmless early but drops the late moment 100 -> 50.
+    r = cleanup(
+        client,
+        ["new"],
+        ["2026-03-01T00:00:00Z", "2026-08-01T00:00:00Z"],
+    )
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["decreased"] == [
+        {"at": "2026-08-01T00:00:00+00:00", "before": 100, "after": 50}
+    ]
+    # atomicity: nothing was deleted
+    body = plan(client, "2026-08-01T00:00:00Z").json()
+    assert body["snapshot"]["id"] == "new"
+    assert body["endpoint"] == 100
+    body = plan(client, "2026-03-01T00:00:00Z").json()
+    assert body["endpoint"] == 50
+
+
+def test_cleanup_blocked_reports_every_decreased_moment(client):
+    register(
+        client,
+        snapshots=[
+            snap("old", "2026-01-01T00:00:00Z", 5),
+            snap("new", "2026-07-01T00:00:00Z", 100),
+        ],
+        segments=[seg("seg-a", "2026-02-01T00:00:00Z", 6, 50)],
+    )
+    # deleting both snapshots removes the recovery point at both moments:
+    # 50 -> null and 100 -> null; null ranks below every sequence number
+    r = cleanup(
+        client,
+        ["old", "new"],
+        ["2026-03-01T00:00:00Z", "2026-08-01T00:00:00Z"],
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"]["decreased"] == [
+        {"at": "2026-03-01T00:00:00+00:00", "before": 50, "after": None},
+        {"at": "2026-08-01T00:00:00+00:00", "before": 100, "after": None},
+    ]
+    # nothing deleted
+    assert plan(client, "2026-08-01T00:00:00Z").json()["endpoint"] == 100
+
+
+def test_cleanup_null_to_null_is_not_a_decrease(client):
+    register(
+        client,
+        snapshots=[snap("s1", "2026-01-01T00:00:00Z", 7)],
+        segments=[seg("l1", "2026-02-01T00:00:00Z", 8, 20)],
+    )
+    # guard moments where deleting l1 changes nothing visible:
+    # 2020: null before and after (null is allowed to stay null);
+    # 2026-01-15: l1 does not exist yet, endpoint is 7 either way
+    r = cleanup(
+        client,
+        ["l1"],
+        ["2020-01-01T00:00:00Z", "2026-01-15T00:00:00Z"],
+    )
+    assert r.status_code == 200
+    assert r.json()["endpoints"] == [
+        {"at": "2020-01-01T00:00:00+00:00", "endpoint": None},
+        {"at": "2026-01-15T00:00:00+00:00", "endpoint": 7},
+    ]
+    # the segment is really gone
+    assert plan(client, "2026-03-01T00:00:00Z").json()["endpoint"] == 7
+
+
+def test_cleanup_may_remove_original_snapshot_and_replay_chain(client):
+    register(
+        client,
+        snapshots=[
+            snap("a", "2026-01-01T00:00:00Z", 0),
+            snap("b", "2026-01-01T00:00:00Z", 10),   # original winner (higher applied_seq)
+        ],
+        segments=[
+            seg("sa", "2026-01-01T00:00:00Z", 1, 10),  # chain winner (smaller id)
+            seg("sb", "2026-01-01T00:00:00Z", 1, 10),
+        ],
+    )
+    # before: snapshot "b" alone reaches 10; "a" + chain also reaches 10
+    assert plan(client, "2026-06-01T00:00:00Z").json()["snapshot"]["id"] == "b"
+    # delete the original winning snapshot AND the original winning chain
+    # segment: "a" + "sb" still reaches 10, so the endpoint does not drop
+    r = cleanup(client, ["b", "sa"], ["2026-06-01T00:00:00Z"])
+    assert r.status_code == 200
+    assert r.json()["endpoints"] == [
+        {"at": "2026-06-01T00:00:00+00:00", "endpoint": 10}
+    ]
+    body = plan(client, "2026-06-01T00:00:00Z").json()
+    assert body["snapshot"]["id"] == "a"
+    assert body["replay"] == [{"id": "sb", "from_seq": 1, "to_seq": 10}]
+    assert body["endpoint"] == 10
+
+
+def test_cleanup_unknown_id_rejects_whole_request_without_partial_delete(client):
+    register(
+        client,
+        snapshots=[snap("s1", "2026-01-01T00:00:00Z", 7)],
+        segments=[seg("l1", "2026-02-01T00:00:00Z", 8, 20)],
+    )
+    r = cleanup(
+        client,
+        ["l1", "ghost"],
+        ["2026-06-01T00:00:00Z"],
+    )
+    assert r.status_code == 409
+    assert "ghost" in r.json()["detail"]
+    # the valid id in the same request was not deleted either
+    assert plan(client, "2026-06-01T00:00:00Z").json()["endpoint"] == 20
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"ids": [], "moments": ["2026-06-01T00:00:00Z"]},                 # no ids
+        {"ids": ["s1"], "moments": []},                                   # no moments
+        {"ids": [""], "moments": ["2026-06-01T00:00:00Z"]},               # empty id
+        {"ids": ["a", "a"], "moments": ["2026-06-01T00:00:00Z"]},         # duplicate id
+        {"ids": ["a"] * 101, "moments": ["2026-06-01T00:00:00Z"]},        # >100 ids
+        {"ids": ["a"], "moments": ["2026-06-01T00:00:00Z"] * 9},          # >8 moments
+        {"ids": ["a"], "moments": ["not-a-time"]},                        # bad moment
+        {"ids": ["a"], "moments": ["2026-06-01T00:00:00Z"], "x": 1},      # unknown field
+    ],
+)
+def test_cleanup_invalid_request_rejected(client, payload):
+    assert client.post("/cleanup", json=payload).status_code == 422
+
+
+def test_cleanup_accepts_up_to_100_ids_and_preserves_order(client):
+    segments = [seg(f"l{i}", "2026-01-01T00:00:00Z", i, i) for i in range(1, 101)]
+    assert register(client, segments=segments).status_code == 201
+    # no snapshots at all: endpoint null at the guard moment before and after
+    r = cleanup(client, [f"l{i}" for i in range(1, 101)], ["2026-06-01T00:00:00Z"])
+    assert r.status_code == 200
+    body = r.json()
+    assert body["deleted_ids"] == [f"l{i}" for i in range(1, 101)]
+    assert body["endpoints"] == [
+        {"at": "2026-06-01T00:00:00+00:00", "endpoint": None}
+    ]
+    # they are really gone: repeating the request now reports unknown ids
+    r2 = cleanup(client, ["l1"], ["2026-06-01T00:00:00Z"])
+    assert r2.status_code == 409
+
+
+def test_cleanup_duplicate_moments_allowed_and_echoed_in_order(client):
+    register(client, snapshots=[snap("s1", "2026-01-01T00:00:00Z", 7)])
+    r = cleanup(
+        client,
+        ["s1"],
+        ["2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"],
+    )
+    assert r.status_code == 200
+    assert r.json()["endpoints"] == [
+        {"at": "2020-01-01T00:00:00+00:00", "endpoint": None},
+        {"at": "2020-01-01T00:00:00+00:00", "endpoint": None},
+    ]
+
+
+def test_cleanup_normalizes_moment_timezone_offsets(client):
+    register(client, snapshots=[snap("s1", "2026-01-01T02:00:00+02:00", 7)])
+    # == 2026-01-01T00:00:00Z, snapshot visible (inclusive boundary):
+    # deleting it drops endpoint 7 -> null, so the request must be blocked
+    r = cleanup(client, ["s1"], ["2026-01-01T02:00:00+02:00"])
+    assert r.status_code == 409
+    assert r.json()["detail"]["decreased"] == [
+        {"at": "2026-01-01T00:00:00+00:00", "before": 7, "after": None}
+    ]
+    assert plan(client, "2026-01-01T00:00:00Z").status_code == 200

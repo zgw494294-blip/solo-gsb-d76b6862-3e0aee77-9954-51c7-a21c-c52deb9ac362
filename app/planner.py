@@ -97,6 +97,20 @@ def best_chain(
     return best[start_seq]
 
 
+def best_endpoint(
+    snapshots: Sequence[Snapshot],
+    segments: Sequence[LogSegment],
+    at: datetime,
+) -> Optional[int]:
+    """Best recovery endpoint at ``at`` under the same rules as :func:`build_plan`.
+
+    Returns ``None`` when no snapshot is visible at or before ``at`` — the
+    null recovery point, which compares below every sequence number.
+    """
+    plan = build_plan(snapshots, segments, at)
+    return None if plan is None else plan.endpoint
+
+
 def build_plan(
     snapshots: Sequence[Snapshot],
     segments: Sequence[LogSegment],
